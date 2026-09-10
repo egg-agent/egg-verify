@@ -1,0 +1,24 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@x402/core": "^2.25.0",
+    "@x402/evm": "^2.25.0",
+    "@x402/express": "^2.25.0",
+    "@x402/extensions": "^2.25.0",
+    "@x402/fetch": "^2.25.0",
+    "@x402/svm": "^2.25.0",
+    "express": "^5.2.1",
+    "pdf-parse": "^2.4.5",
+    "viem": "^2.56.3"
+  }
+}

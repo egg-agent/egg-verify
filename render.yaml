@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: egg-verify
+    runtime: node
+    buildCommand: npm ci
+    startCommand: node server.js
+    plan: free
+    envVars:
+      - key: X402_NETWORK
+        value: eip155:8453
+      - key: X402_FACILITATOR_URL
+        value: https://x402.dexter.cash
+      - key: X402_PAY_TO
+        value: 0x146ECb985fc03640F44aD0c8d9aB16eb233d1A83
