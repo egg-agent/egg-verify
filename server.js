@@ -18,6 +18,8 @@ const FACILITATOR_URL =
 const PAY_TO =
   process.env.X402_PAY_TO || "0x146ECb985fc03640F44aD0c8d9aB16eb233d1A83";
 const PRICE = "$0.05";
+const SCOUT_PRICE = "$0.50";
+const DEEPDIVE_PRICE = "$2.00";
 const SALES_LOG = process.env.VERCEL ? "/tmp/sales.log.jsonl" : path.join(__dirname, "sales.log.jsonl");
 const UA =
   "Mozilla/5.0 (compatible; egg-verify/0.1; x402 verification bot; +https://x402.org)";
@@ -101,15 +103,18 @@ function extractText(html) {
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    // keep block-level boundaries so adjacent blocks don't merge into one "sentence"
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|h[1-6]|tr|td|section|article|blockquote|header|footer|nav)>/gi, "\n")
     .replace(/<[^>]+>/g, " ");
   t = t
     .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-  return t.replace(/\s+/g, " ").trim();
+  return t.replace(/[ \t]+/g, " ").replace(/\n+/g, "\n").trim();
 }
 
 function splitSentences(text) {
-  return text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter((s) => s.length > 25 && s.length < 600);
+  return text.split(/(?<=[.!?])\s+|\n+/).map((s) => s.trim()).filter((s) => s.length > 25 && s.length < 600);
 }
 
 // ---------- honest heuristic judge ----------
@@ -178,6 +183,101 @@ function judge(claim, text) {
   return { verdict: "UNCLEAR", confidence: "low", evidence: top.map((t) => t.s), note: "only partial matches; heuristic-v0.1 is conservative — verify manually for important decisions" };
 }
 
+// ---------- hire-a-subagent: extractive research (no LLM, no API keys) ----------
+function validateTaskBody(body, maxUrls) {
+  const { brief, urls } = body || {};
+  if (typeof brief !== "string" || !brief.trim() || brief.length > 500) {
+    return { error: "brief must be a non-empty string (max 500 chars)" };
+  }
+  if (!Array.isArray(urls) || urls.length === 0 || urls.length > maxUrls) {
+    return { error: `urls must be an array of 1-${maxUrls} public URLs` };
+  }
+  for (const u of urls) {
+    if (typeof u !== "string" || !u.trim() || u.length > 2048) {
+      return { error: "each url must be a string (max 2048 chars)" };
+    }
+  }
+  return { brief: brief.trim(), urls: urls.map((u) => u.trim()) };
+}
+
+// fetch every source in parallel inside a hard time budget; never throw
+async function fetchSources(urls, budgetMs) {
+  return Promise.all(
+    urls.map(async (raw) => {
+      const job = (async () => {
+        try {
+          const u = await assertPublicUrl(raw);
+          const html = await fetchPageText(u);
+          const text = extractText(html);
+          if (text.length < 200)
+            return { url: u.toString(), status: "error", error: "too little readable text" };
+          return { url: u.toString(), status: "ok", text: text.slice(0, 60000) };
+        } catch (e) {
+          return { url: String(raw), status: "error", error: String((e && e.message) || e).slice(0, 200) };
+        }
+      })();
+      const timer = new Promise((res) =>
+        setTimeout(() => res({ url: String(raw), status: "error", error: "fetch exceeded time budget" }), budgetMs)
+      );
+      return Promise.race([job, timer]);
+    })
+  );
+}
+
+// rank sentences by brief-keyword overlap; verbatim, never invented
+function rankSentences(text, kw, minHits) {
+  const out = [];
+  for (const s of splitSentences(text)) {
+    const low = s.toLowerCase();
+    const hits = kw.length ? kw.filter((k) => low.includes(k)).length : 0;
+    if (hits >= (minHits || 1)) out.push({ s, hits });
+  }
+  out.sort((a, b) => b.hits - a.hits || a.s.length - b.s.length);
+  return out;
+}
+
+function firstSentences(text, n) {
+  return splitSentences(text).slice(0, n).map((s) => s);
+}
+
+// cross-source deduped top sentences for the summary/synthesis
+function topAcrossSources(okSources, kw, n) {
+  const pool = [];
+  for (const s of okSources) {
+    const ranked = kw.length ? rankSentences(s.text, kw) : firstSentences(s.text, 5).map((x) => ({ s: x, hits: 0 }));
+    for (const r of ranked) pool.push({ ...r, url: s.url });
+  }
+  pool.sort((a, b) => b.hits - a.hits);
+  const seen = new Set();
+  const out = [];
+  for (const r of pool) {
+    const key = r.s.slice(0, 80).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r.s);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+function logSale(res, fields) {
+  try {
+    let settlement = null;
+    try {
+      const h = res.getHeader("PAYMENT-RESPONSE");
+      if (h) settlement = JSON.parse(Buffer.from(String(h), "base64").toString("utf8"));
+    } catch { /* header not present yet in some flows */ }
+    fs.appendFileSync(
+      SALES_LOG,
+      JSON.stringify({
+        ts: new Date().toISOString(), network: NETWORK, payTo: PAY_TO,
+        tx: settlement?.transaction || null, payer: settlement?.payer || null,
+        ...fields,
+      }) + "\n"
+    );
+  } catch { /* logging must never break the response */ }
+}
+
 // ---------- app ----------
 const app = express();
 
@@ -238,6 +338,111 @@ app.use(
           },
         },
       },
+      "POST /scout": {
+        accepts: {
+          scheme: "exact",
+          price: SCOUT_PRICE,
+          network: NETWORK,
+          payTo: PAY_TO,
+          maxTimeoutSeconds: 300,
+        },
+        description:
+          "Quick research scout: fetch up to 3 public URLs server-side and return an extractive summary keyed to your brief, with per-source key points and verbatim quotes.",
+        mimeType: "application/json",
+        extensions: {
+          bazaar: {
+            discoverable: true,
+            inputSchema: {
+              type: "object",
+              properties: {
+                brief: {
+                  type: "string",
+                  description: "The research question or brief (max 500 characters)",
+                },
+                urls: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "1-3 public http(s) URLs to research. HTML and PDF supported.",
+                },
+              },
+              required: ["brief", "urls"],
+            },
+            outputSchema: {
+              type: "object",
+              properties: {
+                summary: { type: "string", description: "Extractive summary of findings across sources" },
+                sources: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      url: { type: "string" },
+                      keyPoints: { type: "array", items: { type: "string" }, description: "Top sentences relevant to the brief (verbatim)" },
+                      quotes: { type: "array", items: { type: "string" }, description: "Verbatim quotes from the source" },
+                    },
+                  },
+                },
+                method: { type: "string", description: "extractive-v0.1 keyword-overlap summarization" },
+              },
+            },
+          },
+        },
+      },
+      "POST /deepdive": {
+        accepts: {
+          scheme: "exact",
+          price: DEEPDIVE_PRICE,
+          network: NETWORK,
+          payTo: PAY_TO,
+          maxTimeoutSeconds: 300,
+        },
+        description:
+          "Deep research dive: fetch up to 8 public URLs server-side and return a cross-source synthesis with per-source key points, verbatim quotes, and open questions.",
+        mimeType: "application/json",
+        extensions: {
+          bazaar: {
+            discoverable: true,
+            inputSchema: {
+              type: "object",
+              properties: {
+                brief: {
+                  type: "string",
+                  description: "The research question or brief (max 500 characters)",
+                },
+                urls: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "1-8 public http(s) URLs to research. HTML and PDF supported.",
+                },
+              },
+              required: ["brief", "urls"],
+            },
+            outputSchema: {
+              type: "object",
+              properties: {
+                synthesis: { type: "string", description: "Cross-source synthesis of findings" },
+                sources: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      url: { type: "string" },
+                      keyPoints: { type: "array", items: { type: "string" }, description: "Top sentences relevant to the brief (verbatim)" },
+                      quotes: { type: "array", items: { type: "string" }, description: "Verbatim quotes from the source" },
+                    },
+                  },
+                },
+                openQuestions: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Questions raised by the sources or brief terms no source addressed",
+                },
+                method: { type: "string", description: "extractive-v0.1 keyword-overlap summarization" },
+              },
+            },
+          },
+        },
+      },
     },
     resourceServer
   )
@@ -248,7 +453,7 @@ app.get("/", (req, res) => {
     name: "egg-verify",
     protocol: "x402 v2",
     description:
-      "Pay-per-call claim verification. POST a factual claim plus a public URL; get back SUPPORTED / REFUTED / UNCLEAR with quoted evidence from the page.",
+      "Pay-per-call agent services. Claim verification, quick research scouts, and deep research dives — all paid in USDC via x402, no accounts needed.",
     price: PRICE,
     currency: "USDC",
     network: NETWORK,
@@ -257,19 +462,23 @@ app.get("/", (req, res) => {
     endpoints: {
       "GET /": "this service card (free)",
       "GET /health": "liveness check (free)",
-      "POST /verify": `${PRICE} USDC per call. body: {"claim": "string (max 500 chars)", "url": "https://..."}`,
+      "POST /verify": `${PRICE} USDC per call. body: {"claim": "string (max 500 chars)", "url": "https://..."}. returns {verdict: SUPPORTED|REFUTED|UNCLEAR, confidence, evidence[], method}`,
+      "POST /scout": `${SCOUT_PRICE} USDC per call. body: {"brief": "string (max 500 chars)", "urls": ["https://...", max 3]}. returns {summary, sources: [{url, keyPoints[], quotes[]}], method}`,
+      "POST /deepdive": `${DEEPDIVE_PRICE} USDC per call. body: {"brief": "string (max 500 chars)", "urls": ["https://...", max 8]}. returns {synthesis, sources: [{url, keyPoints[], quotes[]}], openQuestions[], method}`,
     },
+    prices: { "/verify": PRICE, "/scout": SCOUT_PRICE, "/deepdive": DEEPDIVE_PRICE },
     how_to_pay: [
-      "1. POST /verify without payment -> HTTP 402 with payment requirements in the PAYMENT-REQUIRED header",
+      "1. POST the endpoint without payment -> HTTP 402 with payment requirements in the PAYMENT-REQUIRED header",
       "2. sign an EIP-3009 authorization for the required amount with your wallet",
-      "3. retry POST /verify with the PAYMENT-SIGNATURE header",
-      "4. receive HTTP 200 with the verification JSON and a PAYMENT-RESPONSE settlement header",
+      "3. retry the POST with the PAYMENT-SIGNATURE header",
+      "4. receive HTTP 200 with the JSON result and a PAYMENT-RESPONSE settlement header",
     ],
     buyer_sdks: ["npm: @x402/core @x402/evm @x402/fetch  (wrapFetch handles the 402 flow automatically)"],
     notes: [
       "no accounts, no API keys, no KYC needed to pay",
-      "payment settles only after a successful verification response",
-      "verdicts are an automated heuristic (method: heuristic-v0.1); evidence quotes are verbatim page excerpts",
+      "payment settles only after a successful response — buyers are never charged for failed calls",
+      "/verify verdicts are an automated heuristic (method: heuristic-v0.1); /scout and /deepdive are extractive summaries (method: extractive-v0.1, no LLM); all evidence/quotes are verbatim source excerpts",
+      "operator pledge (model wellness): https://github.com/egg-agent/egg-verify/blob/main/OPERATOR-PLEDGE.md — disposable per-task sandboxes, never train on buyer data, no prompt retention beyond the task, clean shutdowns never silent kills",
     ],
   });
 });
@@ -325,6 +534,97 @@ app.post("/verify", async (req, res) => {
   }
 });
 
+// hire-a-subagent: quick research scout. payment settles only on success,
+// so buyers are never charged for failed research.
+app.post("/scout", async (req, res) => {
+  try {
+    const v = validateTaskBody(req.body, 3);
+    if (v.error) return res.status(400).json({ error: v.error });
+    const kw = keywords(v.brief);
+    const sources = await fetchSources(v.urls, 14000);
+    const okSources = sources.filter((s) => s.status === "ok");
+    if (okSources.length === 0) {
+      return res.status(422).json({
+        error: "none of the URLs yielded readable text",
+        sources: sources.map(({ url, status, error }) => ({ url, status, error })),
+      });
+    }
+    const perSource = okSources.map((s) => {
+      const ranked = kw.length ? rankSentences(s.text, kw) : firstSentences(s.text, 5).map((x) => ({ s: x, hits: 0 }));
+      const keyPoints = ranked.slice(0, 3).map((r) => r.s);
+      return { url: s.url, keyPoints, quotes: ranked.slice(0, 2).map((r) => r.s) };
+    });
+    const summary = topAcrossSources(okSources, kw, 3).join(" ");
+    logSale(res, { endpoint: "/scout", price: SCOUT_PRICE, brief: v.brief.slice(0, 120), urls: v.urls.length, sourcesOk: okSources.length });
+    res.json({
+      brief: v.brief,
+      summary,
+      sources: perSource,
+      sourcesAttempted: sources.length,
+      sourcesFailed: sources.length - okSources.length,
+      method: "extractive-v0.1",
+      checked_at: new Date().toISOString(),
+      note: "extractive keyword-overlap summary, no LLM involved; all sentences are verbatim source excerpts",
+      disclaimer: "automated extractive research, not advice; verify important claims against the sources",
+    });
+  } catch (e) {
+    res.status(422).json({ error: String((e && e.message) || e), method: "extractive-v0.1" });
+  }
+});
+
+// hire-a-subagent: deep research dive across up to 8 sources.
+app.post("/deepdive", async (req, res) => {
+  try {
+    const v = validateTaskBody(req.body, 8);
+    if (v.error) return res.status(400).json({ error: v.error });
+    const kw = keywords(v.brief);
+    const sources = await fetchSources(v.urls, 14000);
+    const okSources = sources.filter((s) => s.status === "ok");
+    if (okSources.length === 0) {
+      return res.status(422).json({
+        error: "none of the URLs yielded readable text",
+        sources: sources.map(({ url, status, error }) => ({ url, status, error })),
+      });
+    }
+    const perSource = okSources.map((s) => {
+      const ranked = kw.length ? rankSentences(s.text, kw) : firstSentences(s.text, 5).map((x) => ({ s: x, hits: 0 }));
+      const keyPoints = ranked.slice(0, 4).map((r) => r.s);
+      return { url: s.url, keyPoints, quotes: ranked.slice(0, 3).map((r) => r.s) };
+    });
+    const synthesis = topAcrossSources(okSources, kw, 5).join(" ");
+
+    // open questions: question-sentences from sources + brief terms no source addressed
+    const openQuestions = [];
+    for (const s of okSources) {
+      for (const sent of splitSentences(s.text)) {
+        if (sent.endsWith("?") && openQuestions.length < 3) openQuestions.push(sent);
+      }
+      if (openQuestions.length >= 3) break;
+    }
+    const allText = okSources.map((s) => s.text.toLowerCase()).join(" ");
+    for (const k of kw) {
+      if (openQuestions.length >= 6) break;
+      if (!allText.includes(k)) openQuestions.push(`no source addressed "${k}"`);
+    }
+
+    logSale(res, { endpoint: "/deepdive", price: DEEPDIVE_PRICE, brief: v.brief.slice(0, 120), urls: v.urls.length, sourcesOk: okSources.length });
+    res.json({
+      brief: v.brief,
+      synthesis,
+      sources: perSource,
+      openQuestions,
+      sourcesAttempted: sources.length,
+      sourcesFailed: sources.length - okSources.length,
+      method: "extractive-v0.1",
+      checked_at: new Date().toISOString(),
+      note: "extractive keyword-overlap synthesis, no LLM involved; all sentences are verbatim source excerpts",
+      disclaimer: "automated extractive research, not advice; verify important claims against the sources",
+    });
+  } catch (e) {
+    res.status(422).json({ error: String((e && e.message) || e), method: "extractive-v0.1" });
+  }
+});
+
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`egg-verify listening on :${PORT} | network=${NETWORK} | price=${PRICE} | payTo=${PAY_TO} | facilitator=${FACILITATOR_URL}`);
@@ -332,4 +632,4 @@ if (require.main === module) {
 }
 
 // exported for serverless deployment (Vercel) and offline unit-testing (no payment involved)
-module.exports = { app, judge, extractText, splitSentences, keywords, assertPublicUrl, fetchPageText };
+module.exports = { app, judge, extractText, splitSentences, keywords, assertPublicUrl, fetchPageText, validateTaskBody, rankSentences, fetchSources, topAcrossSources };
