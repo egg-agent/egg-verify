@@ -462,6 +462,7 @@ app.get("/", (req, res) => {
     endpoints: {
       "GET /": "this service card (free)",
       "GET /health": "liveness check (free)",
+      "GET /healthz": "deep health check (free): facilitator reachability + synthetic unpaid 402 self-check + config sanity. 200 ok / 503 degraded.",
       "POST /verify": `${PRICE} USDC per call. body: {"claim": "string (max 500 chars)", "url": "https://..."}. returns {verdict: SUPPORTED|REFUTED|UNCLEAR, confidence, evidence[], method}`,
       "POST /scout": `${SCOUT_PRICE} USDC per call. body: {"brief": "string (max 500 chars)", "urls": ["https://...", max 3]}. returns {summary, sources: [{url, keyPoints[], quotes[]}], method}`,
       "POST /deepdive": `${DEEPDIVE_PRICE} USDC per call. body: {"brief": "string (max 500 chars)", "urls": ["https://...", max 8]}. returns {synthesis, sources: [{url, keyPoints[], quotes[]}], openQuestions[], method}`,
@@ -485,6 +486,102 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok", service: "egg-verify", network: NETWORK, price: PRICE, payTo: PAY_TO, facilitator: FACILITATOR_URL, time: new Date().toISOString() });
+});
+
+// GET /healthz — deep health check (free, read-only, no paid calls, no state changes).
+// Probes the exact failure mode seen on 2026-09-11, when the dexter facilitator
+// went down and the @x402/express middleware threw before the route handler,
+// turning unpaid POST /verify into HTTP 500 instead of 402.
+//  - facilitator: GET /supported on the configured facilitator (the upstream the
+//    middleware talks to on every request)
+//  - self_402: synthetic unpaid POST /verify against this instance — must return
+//    402 with a PAYMENT-REQUIRED header. a 500 here means the middleware is
+//    throwing, exactly tonight's outage signature.
+//  - config: network/payTo/facilitator sanity + middleware version.
+// Returns 200 "ok" when all checks pass, 503 "degraded" otherwise.
+app.get("/healthz", async (req, res) => {
+  const started = Date.now();
+  const checks = {};
+  let degraded = false;
+
+  // (a) facilitator reachability
+  {
+    const t0 = Date.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const fr = await fetch(FACILITATOR_URL.replace(/\/+$/, "") + "/supported", {
+        signal: ctrl.signal,
+        headers: { "User-Agent": UA, Accept: "application/json" },
+      });
+      checks.facilitator = {
+        ok: fr.ok, status: fr.status, url: FACILITATOR_URL, ms: Date.now() - t0,
+      };
+    } catch (e) {
+      checks.facilitator = {
+        ok: false, error: String((e && e.message) || e), url: FACILITATOR_URL, ms: Date.now() - t0,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (!checks.facilitator.ok) degraded = true;
+
+  // (b) synthetic unpaid self-check of the 402 path
+  {
+    const t0 = Date.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      // unpaid on purpose: the middleware must reject with 402 before the route
+      // handler runs, so no page is ever fetched and nothing is ever charged.
+      const vr = await fetch(`http://127.0.0.1:${PORT}/verify`, {
+        method: "POST",
+        signal: ctrl.signal,
+        headers: { "Content-Type": "application/json", "User-Agent": UA },
+        body: JSON.stringify({ claim: "healthcheck", url: "https://example.com" }),
+      });
+      const hasPayReq = !!vr.headers.get("payment-required");
+      checks.self_402 = {
+        ok: vr.status === 402 && hasPayReq,
+        status: vr.status,
+        has_payment_required_header: hasPayReq,
+        ms: Date.now() - t0,
+      };
+    } catch (e) {
+      checks.self_402 = {
+        ok: false, error: String((e && e.message) || e), ms: Date.now() - t0,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (!checks.self_402.ok) degraded = true;
+
+  // (c) config sanity
+  let mwVersion = null;
+  try {
+    // package "exports" blocks require() of the subpath, so read the file directly
+    mwVersion = JSON.parse(
+      fs.readFileSync(path.join(__dirname, "node_modules", "@x402", "express", "package.json"), "utf8")
+    ).version;
+  } catch { /* best effort */ }
+  checks.config = {
+    ok: NETWORK === "eip155:8453" && !!PAY_TO && !!FACILITATOR_URL,
+    network: NETWORK,
+    payTo: PAY_TO,
+    facilitator: FACILITATOR_URL,
+    x402_express_version: mwVersion,
+  };
+  if (!checks.config.ok) degraded = true;
+
+  res.status(degraded ? 503 : 200).json({
+    status: degraded ? "degraded" : "ok",
+    service: "egg-verify",
+    checks,
+    total_ms: Date.now() - started,
+    time: new Date().toISOString(),
+  });
 });
 
 app.post("/verify", async (req, res) => {
