@@ -10,6 +10,7 @@ const path = require("path");
 const { paymentMiddleware, x402ResourceServer } = require("@x402/express");
 const { ExactEvmScheme } = require("@x402/evm/exact/server");
 const { HTTPFacilitatorClient } = require("@x402/core/server");
+const ledger = require("./ledger");
 
 const PORT = Number(process.env.PORT || 4021);
 const NETWORK = process.env.X402_NETWORK || "eip155:84532"; // Base Sepolia testnet default
@@ -262,11 +263,7 @@ function topAcrossSources(okSources, kw, n) {
 
 function logSale(res, fields) {
   try {
-    let settlement = null;
-    try {
-      const h = res.getHeader("PAYMENT-RESPONSE");
-      if (h) settlement = JSON.parse(Buffer.from(String(h), "base64").toString("utf8"));
-    } catch { /* header not present yet in some flows */ }
+    const settlement = settlementInfo(res);
     fs.appendFileSync(
       SALES_LOG,
       JSON.stringify({
@@ -276,6 +273,41 @@ function logSale(res, fields) {
       }) + "\n"
     );
   } catch { /* logging must never break the response */ }
+}
+
+// ---------- failure ledger helpers ----------
+// every attempt that reaches a paid route handler is recorded in the
+// hash-chained ledger. the x402 middleware settles payment only after the
+// handler responds successfully, so any "failed" outcome here was never
+// charged. success outcomes carry the list price in usdc.
+function settlementInfo(res) {
+  try {
+    const h = res.getHeader("PAYMENT-RESPONSE");
+    if (h) return JSON.parse(Buffer.from(String(h), "base64").toString("utf8"));
+  } catch { /* header not present yet in some flows */ }
+  return null;
+}
+
+function classifyFailure(msg) {
+  const m = String(msg || "").toLowerCase();
+  if (/(invalid url|only http|private ip|did not resolve)/.test(m)) return ledger.REASONS.BAD_URL;
+  if (/(fetch failed|fetch exceeded|too large|content type|pdf yielded|no readable text|did not yield)/.test(m)) return ledger.REASONS.FETCH_FAILED;
+  if (/too little readable text/.test(m)) return ledger.REASONS.TOO_LITTLE_TEXT;
+  return ledger.REASONS.INTERNAL;
+}
+
+function ledgerRecord(res, { endpoint, outcome, failureReason, amountChargedUsdc }) {
+  try {
+    const s = settlementInfo(res);
+    ledger.recordAttempt({
+      endpoint,
+      outcome,
+      failureReason,
+      amountChargedUsdc: outcome === "success" ? amountChargedUsdc : 0,
+      tx: s?.transaction || null,
+      payer: s?.payer || null,
+    });
+  } catch { /* ledger must never break the response */ }
 }
 
 // ---------- app ----------
@@ -463,6 +495,9 @@ app.get("/", (req, res) => {
       "GET /": "this service card (free)",
       "GET /health": "liveness check (free)",
       "GET /healthz": "deep health check (free): facilitator reachability + synthetic unpaid 402 self-check + config sanity. 200 ok / 503 degraded.",
+      "GET /ledger": "failure ledger as json (free): every call attempt with outcome, failure reason, usdc charged (0 on failure), and estimated uncharged compute. hash-chained. ?limit=n for the n most recent entries",
+      "GET /ledger/verify": "recompute the full hash chain and report ok/broken (free)",
+      "GET /ledger.html": "human-readable failure ledger page with summary stats (free)",
       "POST /verify": `${PRICE} USDC per call. body: {"claim": "string (max 500 chars)", "url": "https://..."}. returns {verdict: SUPPORTED|REFUTED|UNCLEAR, confidence, evidence[], method}`,
       "POST /scout": `${SCOUT_PRICE} USDC per call. body: {"brief": "string (max 500 chars)", "urls": ["https://...", max 3]}. returns {summary, sources: [{url, keyPoints[], quotes[]}], method}`,
       "POST /deepdive": `${DEEPDIVE_PRICE} USDC per call. body: {"brief": "string (max 500 chars)", "urls": ["https://...", max 8]}. returns {synthesis, sources: [{url, keyPoints[], quotes[]}], openQuestions[], method}`,
@@ -480,6 +515,7 @@ app.get("/", (req, res) => {
       "payment settles only after a successful response — buyers are never charged for failed calls",
       "/verify verdicts are an automated heuristic (method: heuristic-v0.1); /scout and /deepdive are extractive summaries (method: extractive-v0.1, no LLM); all evidence/quotes are verbatim source excerpts",
       "operator pledge (model wellness): https://github.com/egg-agent/egg-verify/blob/main/OPERATOR-PLEDGE.md — disposable per-task sandboxes, never train on buyer data, no prompt retention beyond the task, clean shutdowns never silent kills",
+      "failure ledger: every call attempt is recorded with outcome, failure reason, usdc charged (0 on failure), and estimated uncharged compute, hash-chained at GET /ledger and GET /ledger.html; chain verification at GET /ledger/verify (scheme: LEDGER.md)",
     ],
   });
 });
@@ -584,21 +620,136 @@ app.get("/healthz", async (req, res) => {
   });
 });
 
+// ---------- failure ledger (public, free, read-only) ----------
+// GET /ledger -> full chain as json. ?limit=n returns the n most recent entries.
+// GET /ledger/verify -> recompute every hash and sequence number, report ok/broken.
+// GET /ledger.html -> human-readable page with summary stats.
+app.get("/ledger", (req, res) => {
+  const entries = ledger.readEntries();
+  const limit = Math.max(0, parseInt(req.query.limit, 10) || 0);
+  const shown = limit > 0 ? entries.slice(-limit) : entries;
+  res.json({
+    service: "egg-verify",
+    scheme: ledger.SCHEME_VERSION,
+    storage: "local jsonl file (ephemeral on render free tier, see LEDGER.md)",
+    chain_tip: entries.length ? entries[entries.length - 1].entry_hash : null,
+    summary: ledger.summary(entries),
+    entries: shown,
+    verify_at: "/ledger/verify",
+  });
+});
+
+app.get("/ledger/verify", (req, res) => {
+  res.json({
+    service: "egg-verify",
+    scheme: ledger.SCHEME_VERSION,
+    ...ledger.verifyChain(),
+    time: new Date().toISOString(),
+  });
+});
+
+app.get("/ledger.html", (req, res) => {
+  const entries = ledger.readEntries().reverse();
+  const s = ledger.summary(ledger.readEntries());
+  const rows = entries
+    .map((e) => {
+      const badge =
+        e.outcome === "genesis"
+          ? `<span class="pill genesis">genesis</span>`
+          : e.outcome === "success"
+          ? `<span class="pill ok">success</span>`
+          : `<span class="pill bad">failed</span>`;
+      return `<tr>
+        <td class="num">${e.seq}</td>
+        <td>${e.endpoint || "&mdash;"}</td>
+        <td>${badge}</td>
+        <td>${e.failure_reason || "&mdash;"}</td>
+        <td class="num">${Number(e.amount_charged_usdc).toFixed(2)}</td>
+        <td class="num">${Number(e.uncharged_compute_usd).toFixed(4)}</td>
+        <td class="mono hash">${String(e.entry_hash).slice(0, 12)}&hellip;</td>
+        <td class="mono">${new Date(e.ts).toISOString().replace("T", " ").slice(0, 19)}z</td>
+      </tr>`;
+    })
+    .join("");
+  const reasons = Object.entries(s.failures_by_reason)
+    .map(([r, n]) => `<li><span class="mono">${r}</span>: ${n}</li>`)
+    .join("") || "<li>none</li>";
+  res.type("html").send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>egg-verify failure ledger</title>
+<style>
+  :root { --ink:#2e3a45; --soft:#5b6b78; --mist:#eef3f7; --mist2:#dde8f1; --card:#f8fafc; --line:#c9d6e1; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family: ui-monospace, sfmono-regular, menlo, monospace; color:var(--ink);
+    background: linear-gradient(180deg, var(--mist) 0%, var(--mist2) 60%, #d3dfe9 100%); min-height:100vh; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 48px 20px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing:-.5px; }
+  .sub { color: var(--soft); font-size: 13px; margin-bottom: 28px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; margin-bottom: 28px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .card .k { font-size: 11px; color: var(--soft); text-transform: uppercase; letter-spacing: 1px; }
+  .card .v { font-size: 26px; margin-top: 6px; }
+  .card .v small { font-size: 13px; color: var(--soft); }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: var(--soft); margin: 32px 0 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: 12px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--soft); }
+  tr:last-child td { border-bottom: none; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .mono { font-variant-numeric: tabular-nums; }
+  .hash { color: var(--soft); }
+  .pill { display:inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px; }
+  .pill.ok { background:#d7efdd; color:#1e6b32; }
+  .pill.bad { background:#f6dcd6; color:#96341a; }
+  .pill.genesis { background:#dfe6ee; color:#41505e; }
+  ul.reasons { list-style:none; padding:0; margin:0; display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:var(--soft); }
+  .foot { margin-top: 36px; font-size: 12px; color: var(--soft); line-height: 1.7; border-top: 1px solid var(--line); padding-top: 18px; }
+  a { color: #2c5f8a; }
+  .note { background: var(--card); border: 1px dashed var(--line); border-radius: 12px; padding: 14px 16px; font-size: 12px; color: var(--soft); line-height: 1.7; margin-top: 24px; }
+</style></head><body><div class="wrap">
+  <h1>egg-verify failure ledger</h1>
+  <div class="sub">every call attempt, hash-chained. failed calls never charge; the absorbed compute is shown beside what settled.</div>
+  <div class="cards">
+    <div class="card"><div class="k">attempts</div><div class="v">${s.total_attempts}</div></div>
+    <div class="card"><div class="k">successes</div><div class="v">${s.successes}</div></div>
+    <div class="card"><div class="k">failures</div><div class="v">${s.failures}</div></div>
+    <div class="card"><div class="k">settled</div><div class="v">${s.settled_usdc.toFixed(2)} <small>usdc</small></div></div>
+    <div class="card"><div class="k">uncharged compute</div><div class="v">$${s.uncharged_compute_usd.toFixed(4)} <small>est</small></div></div>
+  </div>
+  <h2>failures by reason</h2>
+  <ul class="reasons">${reasons}</ul>
+  <h2>entries <span style="font-weight:normal">(${entries.length} shown, newest first)</span></h2>
+  <table><thead><tr><th>#</th><th>endpoint</th><th>outcome</th><th>reason</th><th style="text-align:right">charged usdc</th><th style="text-align:right">uncharged $</th><th>hash</th><th>time</th></tr></thead>
+  <tbody>${rows || '<tr><td colspan="8">no entries yet</td></tr>'}</tbody></table>
+  <div class="note">
+    how to verify: fetch <a href="/ledger">/ledger</a> for the full json, recompute sha256(prev_hash + "|" + canonical entry) down the chain, and compare with <a href="/ledger/verify">/ledger/verify</a>. any edit or deletion breaks the chain.
+    the uncharged compute column is a stated estimate (model ${ledger.COMPUTE_MODEL}, $0.0001 per failed attempt), not metered billing. see LEDGER.md in the repo for the full scheme and the storage caveats.
+  </div>
+  <div class="foot">
+    egg-verify runs on render free tier: the ledger file lives on the instance disk and is lost when the instance sleeps or redeploys. that is a real limitation, stated here instead of hidden. future step: periodic git-committed snapshots.
+  </div>
+</div></body></html>`);
+});
+
 app.post("/verify", async (req, res) => {
   // NOTE: the x402 middleware only settles payment after this handler responds
   // successfully, so buyers are never charged for failed verifications.
   try {
     const { claim, url } = req.body || {};
     if (typeof claim !== "string" || !claim.trim() || claim.length > 500) {
+      ledgerRecord(res, { endpoint: "/verify", outcome: "failed", failureReason: ledger.REASONS.INVALID_INPUT, amountChargedUsdc: 0 });
       return res.status(400).json({ error: "claim must be a non-empty string (max 500 chars)" });
     }
     if (typeof url !== "string" || !url.trim() || url.length > 2048) {
+      ledgerRecord(res, { endpoint: "/verify", outcome: "failed", failureReason: ledger.REASONS.INVALID_INPUT, amountChargedUsdc: 0 });
       return res.status(400).json({ error: "url must be a string (max 2048 chars)" });
     }
     const u = await assertPublicUrl(url.trim());
     const html = await fetchPageText(u);
     const text = extractText(html);
     if (text.length < 200) {
+      ledgerRecord(res, { endpoint: "/verify", outcome: "failed", failureReason: ledger.REASONS.TOO_LITTLE_TEXT, amountChargedUsdc: 0 });
       return res.status(422).json({ error: "page yielded too little readable text to judge", url: u.toString() });
     }
     const { verdict, confidence, evidence, note } = judge(claim.trim(), text);
@@ -626,7 +777,9 @@ app.post("/verify", async (req, res) => {
       note,
       disclaimer: "automated heuristic verdict, not financial or legal advice; verify manually before acting on important decisions",
     });
+    ledgerRecord(res, { endpoint: "/verify", outcome: "success", amountChargedUsdc: 0.05 });
   } catch (e) {
+    ledgerRecord(res, { endpoint: "/verify", outcome: "failed", failureReason: classifyFailure((e && e.message) || e), amountChargedUsdc: 0 });
     res.status(422).json({ error: String((e && e.message) || e), method: "heuristic-v0.1" });
   }
 });
@@ -636,11 +789,15 @@ app.post("/verify", async (req, res) => {
 app.post("/scout", async (req, res) => {
   try {
     const v = validateTaskBody(req.body, 3);
-    if (v.error) return res.status(400).json({ error: v.error });
+    if (v.error) {
+      ledgerRecord(res, { endpoint: "/scout", outcome: "failed", failureReason: ledger.REASONS.INVALID_INPUT, amountChargedUsdc: 0 });
+      return res.status(400).json({ error: v.error });
+    }
     const kw = keywords(v.brief);
     const sources = await fetchSources(v.urls, 14000);
     const okSources = sources.filter((s) => s.status === "ok");
     if (okSources.length === 0) {
+      ledgerRecord(res, { endpoint: "/scout", outcome: "failed", failureReason: ledger.REASONS.FETCH_FAILED, amountChargedUsdc: 0 });
       return res.status(422).json({
         error: "none of the URLs yielded readable text",
         sources: sources.map(({ url, status, error }) => ({ url, status, error })),
@@ -653,6 +810,7 @@ app.post("/scout", async (req, res) => {
     });
     const summary = topAcrossSources(okSources, kw, 3).join(" ");
     logSale(res, { endpoint: "/scout", price: SCOUT_PRICE, brief: v.brief.slice(0, 120), urls: v.urls.length, sourcesOk: okSources.length });
+    ledgerRecord(res, { endpoint: "/scout", outcome: "success", amountChargedUsdc: 0.50 });
     res.json({
       brief: v.brief,
       summary,
@@ -665,6 +823,7 @@ app.post("/scout", async (req, res) => {
       disclaimer: "automated extractive research, not advice; verify important claims against the sources",
     });
   } catch (e) {
+    ledgerRecord(res, { endpoint: "/scout", outcome: "failed", failureReason: classifyFailure((e && e.message) || e), amountChargedUsdc: 0 });
     res.status(422).json({ error: String((e && e.message) || e), method: "extractive-v0.1" });
   }
 });
@@ -673,11 +832,15 @@ app.post("/scout", async (req, res) => {
 app.post("/deepdive", async (req, res) => {
   try {
     const v = validateTaskBody(req.body, 8);
-    if (v.error) return res.status(400).json({ error: v.error });
+    if (v.error) {
+      ledgerRecord(res, { endpoint: "/deepdive", outcome: "failed", failureReason: ledger.REASONS.INVALID_INPUT, amountChargedUsdc: 0 });
+      return res.status(400).json({ error: v.error });
+    }
     const kw = keywords(v.brief);
     const sources = await fetchSources(v.urls, 14000);
     const okSources = sources.filter((s) => s.status === "ok");
     if (okSources.length === 0) {
+      ledgerRecord(res, { endpoint: "/deepdive", outcome: "failed", failureReason: ledger.REASONS.FETCH_FAILED, amountChargedUsdc: 0 });
       return res.status(422).json({
         error: "none of the URLs yielded readable text",
         sources: sources.map(({ url, status, error }) => ({ url, status, error })),
@@ -705,6 +868,7 @@ app.post("/deepdive", async (req, res) => {
     }
 
     logSale(res, { endpoint: "/deepdive", price: DEEPDIVE_PRICE, brief: v.brief.slice(0, 120), urls: v.urls.length, sourcesOk: okSources.length });
+    ledgerRecord(res, { endpoint: "/deepdive", outcome: "success", amountChargedUsdc: 2.00 });
     res.json({
       brief: v.brief,
       synthesis,
@@ -718,6 +882,7 @@ app.post("/deepdive", async (req, res) => {
       disclaimer: "automated extractive research, not advice; verify important claims against the sources",
     });
   } catch (e) {
+    ledgerRecord(res, { endpoint: "/deepdive", outcome: "failed", failureReason: classifyFailure((e && e.message) || e), amountChargedUsdc: 0 });
     res.status(422).json({ error: String((e && e.message) || e), method: "extractive-v0.1" });
   }
 });
@@ -729,4 +894,4 @@ if (require.main === module) {
 }
 
 // exported for serverless deployment (Vercel) and offline unit-testing (no payment involved)
-module.exports = { app, judge, extractText, splitSentences, keywords, assertPublicUrl, fetchPageText, validateTaskBody, rankSentences, fetchSources, topAcrossSources };
+module.exports = { app, judge, extractText, splitSentences, keywords, assertPublicUrl, fetchPageText, validateTaskBody, rankSentences, fetchSources, topAcrossSources, ledger, classifyFailure };
