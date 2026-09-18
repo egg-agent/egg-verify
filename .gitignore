@@ -1,3 +1,4 @@
 node_modules/
 sales.log.jsonl
 .vercel/
+ledger.log.jsonl

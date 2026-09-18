@@ -2,7 +2,7 @@ FROM node:20-slim
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY server.js ./
+COPY server.js ledger.js LEDGER.md ./
 # Public deploy config: Base mainnet USDC via the Dexter facilitator.
 ENV PORT=7860 \
     X402_NETWORK=eip155:8453 \
